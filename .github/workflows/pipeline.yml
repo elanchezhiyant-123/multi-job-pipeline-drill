@@ -22,8 +22,6 @@ jobs:
           node-version: '20'
       - run: npm ci
       - run: npm run lint
-        env:
-          ESLINT_USE_FLAT_CONFIG: false
 
   # Stage 2A: Unit Validation (Parallel Fan-Out)
   unit-tests:

@@ -1,14 +1,20 @@
-name: CI Pipeline
+name: Production CI/CD Pipeline
 
 on:
   push:
-    branches: ['*']
+    branches: [main, fix/pipeline-orchestration]
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.ref }}-pipeline
+  cancel-in-progress: true
+
 jobs:
+  # Stage 1: Static Code Analysis
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -17,8 +23,12 @@ jobs:
       - run: npm ci
       - run: npm run lint
 
+  # Stage 2A: Unit Validation (Parallel Fan-Out)
   unit-tests:
     runs-on: ubuntu-latest
+    # Wait for linting to pass before executing unit tests
+    needs: lint
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -27,8 +37,12 @@ jobs:
       - run: npm ci
       - run: npm test
 
+  # Stage 2B: Application Build (Parallel Fan-Out)
   build:
     runs-on: ubuntu-latest
+    # Wait for linting to pass before initiating application compilation
+    needs: lint
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -36,32 +50,73 @@ jobs:
           node-version: '20'
       - run: npm ci
       - run: npm run build
-      # Problem 4: no upload-artifact step — dist/ is never saved
+      # Persist compiled output across isolated runner boundaries
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-build
+          path: dist/
+          retention-days: 3
 
+  # Stage 3: Integration Validation
   integration-tests:
     runs-on: ubuntu-latest
+    # Wait for build execution to ensure compiled artifacts exist
+    needs: build
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+      # Retrieve compiled output onto fresh virtual machine environment
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-build
+          path: dist/
       - run: npm ci
-      # Problem 2: no download-artifact — dist/ does not exist on this machine
       - run: npm run test:integration
 
+  # Stage 4: Staging Deployment Gate (Fan-In)
   deploy-staging:
     runs-on: ubuntu-latest
-    # Problem 3: no if condition — runs on every branch
+    # Fan-in gate: Require both unit and integration testing suites to pass
+    needs: [unit-tests, integration-tests]
+    timeout-minutes: 15
+    # Enforce main branch protection and upstream success gating
+    if: success() && github.ref == 'refs/heads/main'
+    environment: staging
     steps:
-      - run: echo "Deploying to staging environment"
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-build
+          path: dist/
+      - run: echo "Deploying artifact to Staging environment..."
 
+  # Stage 5: Production Deployment Gate
   deploy-production:
     runs-on: ubuntu-latest
+    # Promotion gate: Require successful staging deployment
+    needs: deploy-staging
+    timeout-minutes: 15
+    # Restrict production release strictly to main branch pushes
+    if: success() && github.ref == 'refs/heads/main'
+    environment: production
     steps:
-      - run: echo "Deploying to production environment"
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-build
+          path: dist/
+      - run: echo "Deploying artifact to Production environment..."
 
+  # Stage 6: Universal Pipeline Notification
   notify:
     runs-on: ubuntu-latest
-    # Problem 6: no if: always() — skipped when upstream fails
+    needs: [unit-tests, integration-tests, deploy-staging, deploy-production]
+    # Always execute regardless of upstream status (success, failure, or skip)
+    if: always()
     steps:
-      - run: echo "Pipeline notification sent"
+      - run: echo "Pipeline run finalized. Dispatching notification digest."
